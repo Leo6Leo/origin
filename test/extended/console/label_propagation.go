@@ -95,8 +95,12 @@ var _ = g.Describe("[sig-console][apigroup:config.openshift.io][OCPFeatureGate:I
 		o.Expect(err).NotTo(o.HaveOccurred())
 		domain = ingress.Spec.Domain
 
-		isHCP, err := exutil.IsHypershift(context.TODO(), configClient)
-		o.Expect(err).NotTo(o.HaveOccurred(), "failed to determine whether the cluster is HyperShift")
+		// Read the Infrastructure directly rather than via exutil.IsHypershift,
+		// which reports "not HyperShift" when the read fails. On HCP that would
+		// silently send the test down the guest Ingress path the VAP rejects.
+		infra, err := configClient.ConfigV1().Infrastructures().Get(context.TODO(), "cluster", metav1.GetOptions{})
+		o.Expect(err).NotTo(o.HaveOccurred(), "failed to read Infrastructure to determine whether the cluster is HyperShift")
+		isHCP := infra.Status.ControlPlaneTopology == configv1.ExternalTopologyMode
 		interval = pollInterval
 		timeout = pollTimeout
 		if isHCP {
@@ -466,9 +470,14 @@ func waitForRouteWithLabels(configClient configclient.Interface, client routecli
 // object returned by Update), so callers can detect fields pruned by the CRD
 // schema without an extra Get.
 func hcpModifyComponentRoutes(hcp *hcpContext, modify func([]interface{}) []interface{}) ([]interface{}, error) {
+	// RetryOnConflict does not bound a blocked API request; give the whole
+	// read-modify-write one deadline.
+	ctx, cancel := context.WithTimeout(context.TODO(), hcpPollTimeout)
+	defer cancel()
+
 	var persisted []interface{}
 	err := retry.RetryOnConflict(retry.DefaultBackoff, func() error {
-		hc, err := hcp.dynamicClient.Resource(hostedClusterGVR).Namespace(hostedClusterConfigsNamespace).Get(context.TODO(), hcp.hostedClusterName, metav1.GetOptions{})
+		hc, err := hcp.dynamicClient.Resource(hostedClusterGVR).Namespace(hostedClusterConfigsNamespace).Get(ctx, hcp.hostedClusterName, metav1.GetOptions{})
 		if err != nil {
 			return fmt.Errorf("failed to get HostedCluster %s/%s: %w", hostedClusterConfigsNamespace, hcp.hostedClusterName, err)
 		}
@@ -483,7 +492,7 @@ func hcpModifyComponentRoutes(hcp *hcpContext, modify func([]interface{}) []inte
 			return fmt.Errorf("failed to set componentRoutes on HostedCluster: %w", err)
 		}
 
-		updated, err := hcp.dynamicClient.Resource(hostedClusterGVR).Namespace(hostedClusterConfigsNamespace).Update(context.TODO(), hc, metav1.UpdateOptions{})
+		updated, err := hcp.dynamicClient.Resource(hostedClusterGVR).Namespace(hostedClusterConfigsNamespace).Update(ctx, hc, metav1.UpdateOptions{})
 		if err != nil {
 			return fmt.Errorf("failed to update HostedCluster %s/%s: %w", hostedClusterConfigsNamespace, hcp.hostedClusterName, err)
 		}
